@@ -1,0 +1,76 @@
+color.rust - contrast algorithms port notes
+=============================================
+
+Purpose
+-------
+This crate contains Rust ports of the contrast algorithms from the `color.js` project.
+It is intentionally minimal: it does not include the full Color.js parsing/model layer.
+
+Public API (numeric inputs)
+-----------------------------
+The following functions are implemented in `src/lib.rs`:
+
+1. `contrast_wcag21(y1: f64, y2: f64) -> f64`
+   - WCAG 2.1 contrast ratio from two relative luminances.
+
+2. `contrast_michelson(y1: f64, y2: f64) -> f64`
+   - Michelson luminance contrast from two luminances.
+
+3. `contrast_weber(y1: f64, y2: f64) -> f64`
+   - Weber luminance contrast from two luminances.
+   - Uses the same divide-by-zero clamp as Color.js (50000).
+
+4. `contrast_lstar(l1: f64, l2: f64) -> f64`
+   - CIE L* absolute difference (|L1 - L2|).
+
+5. `contrast_delta_phi(l1: f64, l2: f64) -> f64`
+   - Delta Phi Star contrast.
+   - Assumes `l1`/`l2` are L* values in the D65 Lab space used by Color.js.
+
+6. `contrast_apca_from_luminance(y_bg: f64, y_txt: f64) -> f64`
+   - APCA contrast computed from the flare-adjusted luminances that Color.js derives.
+   - If you want “full Color.js style” APCA, reproduce the intermediate sRGB luminance
+     computation + `fclamp()` and pass the resulting `(y_bg, y_txt)` here.
+
+Verification workflow (cross-check vs Color.js)
+--------------------------------------------------
+There is an integration test in `tests/contrast_algorithms.rs`.
+It loads `tests/contrast_fixtures.json` and asserts Rust output matches Color.js
+within a small epsilon.
+
+1. Regenerate fixtures from Color.js (optional, when updating algorithms):
+
+   - From the repo root or the `color.js` directory:
+     `cd color.js`
+     `node tools/contrast-fixtures.mjs`
+
+   - This writes:
+     `../color.rust/tests/contrast_fixtures.json`
+
+2. Run Rust tests:
+
+   - `cd ../color.rust`
+   - `cargo test`
+
+Fixtures
+--------
+`tests/contrast_fixtures.json` is checked into the repo after generation.
+It contains only numeric parameters + expected outputs derived from Color.js:
+
+- `wcag21`, `michelson`, `weber`: `{ y1, y2, expect }`
+- `lstar`: `{ l1, l2, expect }`
+- `delta_phi`: `{ l1, l2, expect }`
+- `apca`: `{ y_bg, y_txt, expect }`
+
+Extending the port (needed for “full usability”)
+--------------------------------------------------
+If you want to match Color.js end-to-end (strings like `"#fff"`, `lch(...)`, etc.),
+you will need to port (or call) Color.js equivalents for:
+- color parsing / space conversion
+- computing the required numeric inputs:
+  - relative luminance for WCAG/Michelson/Weber
+  - L* (lab) for Lstar/DeltaPhi
+  - APCA intermediate sRGB luminances + `fclamp`
+
+This crate currently stops at the contrast math given numeric inputs.
+
