@@ -18,10 +18,17 @@
 //!   output/wcag_3_0.bin  - u32[16777216] LE, count per text hex at ratio >= 3.0
 //!   output/wcag_4_5.bin  - u32[16777216] LE, count per text hex at ratio >= 4.5
 //!   output/wcag_7_0.bin  - u32[16777216] LE, count per text hex at ratio >= 7.0
+//!   output/apca_60_histogram.csv  - histogram (1000 bins) of count distribution
+//!   output/apca_75_histogram.csv  - "
+//!   output/apca_90_histogram.csv  - "
+//!   output/wcag_3_0_histogram.csv - "
+//!   output/wcag_4_5_histogram.csv - "
+//!   output/wcag_7_0_histogram.csv - "
 //!   output/metadata.json - summary stats
 //!   output/progress.dat  - resume checkpoint (deleted on completion)
 
 use rayon::prelude::*;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -363,6 +370,12 @@ fn main() {
     )
     .unwrap();
 
+    // 9. Generate histogram CSVs
+    println!("\nGenerating histograms...");
+    for (t, th) in THRESHOLDS.iter().enumerate() {
+        write_histogram_csv(&out.join(format!("{}_histogram.csv", th.name)), &counts[t], th.name);
+    }
+
     // Clean up progress on completion
     let _ = fs::remove_file(&progress_path);
 
@@ -372,4 +385,37 @@ fn main() {
         start.elapsed().as_secs_f64() / 3600.0,
         out.display(),
     );
+}
+
+// ---- Histogram CSV generation ----
+
+fn write_histogram_csv(path: &Path, counts: &[u32], name: &str) {
+    // Collect frequency: how many hex colors have exactly `count` accessible pairs
+    let max_count = *counts.iter().max().unwrap_or(&0) as usize;
+
+    // Use 1000 bins spanning 0..=max_count for a manageable CSV
+    let num_bins: usize = 1000;
+    let bin_width = if max_count == 0 {
+        1.0
+    } else {
+        (max_count as f64 + 1.0) / num_bins as f64
+    };
+
+    let mut bins = vec![0u64; num_bins];
+    for &c in counts {
+        let bin = ((c as f64) / bin_width).min((num_bins - 1) as f64) as usize;
+        bins[bin] += 1;
+    }
+
+    let mut csv = String::with_capacity(num_bins * 40);
+    writeln!(csv, "bin_min,bin_max,count,percent").unwrap();
+    for (i, &freq) in bins.iter().enumerate() {
+        let bin_min = (i as f64 * bin_width) as u64;
+        let bin_max = (((i + 1) as f64 * bin_width) - 1.0).max(bin_min as f64) as u64;
+        let pct = freq as f64 / N as f64 * 100.0;
+        writeln!(csv, "{},{},{},{:.6}", bin_min, bin_max, freq, pct).unwrap();
+    }
+
+    fs::write(path, csv).unwrap();
+    println!("  {} -> {} ({} bins, bin_width={:.1})", name, path.display(), num_bins, bin_width);
 }
