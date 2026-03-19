@@ -94,28 +94,6 @@ fn wcag_ratio(y1: f64, y2: f64) -> f64 {
 // inside the hot 281T iteration loop. The APCA powf calls on the
 // fclamp'd values are the real bottleneck.
 
-/// APCA Lc from pre-fclamp'd luminances. Avoids redundant fclamp in inner loop.
-#[inline(always)]
-fn apca_lc_preclamped(y_bg_fc: f64, y_txt_fc: f64) -> f64 {
-    let c = if (y_bg_fc - y_txt_fc).abs() < DELTA_Y_MIN {
-        0.0
-    } else if y_bg_fc > y_txt_fc {
-        (y_bg_fc.powf(NORM_BG) - y_txt_fc.powf(NORM_TXT)) * SCALE_BOW
-    } else {
-        (y_bg_fc.powf(REV_BG) - y_txt_fc.powf(REV_TXT)) * SCALE_WOB
-    };
-
-    let sapc = if c.abs() < LO_CLIP {
-        0.0
-    } else if c > 0.0 {
-        c - LO_BOW_OFFSET
-    } else {
-        c + LO_WOB_OFFSET
-    };
-
-    sapc * 100.0
-}
-
 // ---- Progress / I/O ----
 
 fn load_progress(path: &Path) -> usize {
@@ -188,6 +166,17 @@ fn main() {
     // 3. Precompute fclamp'd luminance for APCA (avoids fclamp in inner loop)
     let fc_lum: Vec<f64> = raw_lum.par_iter().map(|&y| fclamp(y)).collect();
 
+    // 4. Precompute APCA power arrays — eliminates all powf from the inner loop.
+    //    Background needs ^NORM_BG (0.56) for BOW and ^REV_BG (0.65) for WOB.
+    //    Text needs ^NORM_TXT (0.57) for BOW and ^REV_TXT (0.62) for WOB.
+    //    Text powers are only used once per outer iteration, but precomputing
+    //    them too keeps the hot loop completely powf-free.
+    println!("Precomputing APCA power tables (4 × 16M)...");
+    let pow_norm_bg: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(NORM_BG)).collect();
+    let pow_rev_bg: Vec<f64>  = fc_lum.par_iter().map(|&y| y.powf(REV_BG)).collect();
+    let pow_norm_txt: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(NORM_TXT)).collect();
+    let pow_rev_txt: Vec<f64>  = fc_lum.par_iter().map(|&y| y.powf(REV_TXT)).collect();
+
     println!(
         "Precomputation done in {:.2}s  (lum range: {:.8}..{:.8})",
         start.elapsed().as_secs_f64(),
@@ -247,6 +236,9 @@ fn main() {
             .map(|txt_hex| {
                 let y_txt = raw_lum[txt_hex];
                 let y_txt_fc = fc_lum[txt_hex];
+                // Text-side powers (looked up from precomputed arrays)
+                let txt_pnorm = pow_norm_txt[txt_hex]; // y_txt^0.57
+                let txt_prev  = pow_rev_txt[txt_hex];  // y_txt^0.62
 
                 let mut apca_60: u32 = 0;
                 let mut apca_75: u32 = 0;
@@ -256,8 +248,25 @@ fn main() {
                 let mut wcag_7: u32 = 0;
 
                 for bg_hex in 0..N {
-                    // APCA: use preclamped luminances
-                    let lc = apca_lc_preclamped(fc_lum[bg_hex], y_txt_fc).abs();
+                    // APCA: all lookups, no powf
+                    let y_bg_fc = fc_lum[bg_hex];
+                    let c = if (y_bg_fc - y_txt_fc).abs() < DELTA_Y_MIN {
+                        0.0
+                    } else if y_bg_fc > y_txt_fc {
+                        // BOW: bg^0.56 - txt^0.57
+                        (pow_norm_bg[bg_hex] - txt_pnorm) * SCALE_BOW
+                    } else {
+                        // WOB: bg^0.65 - txt^0.62
+                        (pow_rev_bg[bg_hex] - txt_prev) * SCALE_WOB
+                    };
+                    let sapc = if c.abs() < LO_CLIP {
+                        0.0
+                    } else if c > 0.0 {
+                        c - LO_BOW_OFFSET
+                    } else {
+                        c + LO_WOB_OFFSET
+                    };
+                    let lc = (sapc * 100.0).abs();
                     if lc >= 60.0 {
                         apca_60 += 1;
                         if lc >= 75.0 {
