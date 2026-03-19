@@ -6,26 +6,23 @@
 //!
 //! Optimizations:
 //! - sRGB linearization lookup table (256 entries, no powf(2.4) per channel)
-//! - Precomputed luminance + fclamp'd luminance arrays for all 16M colors
+//! - Precomputed luminance + fclamp'd luminance + APCA powers, packed into a
+//!   single contiguous array-of-structs for cache-friendly sequential access
 //! - rayon into_par_iter across text colors (scales to 128 threads on TR 3990X)
 //! - Resumable: saves progress.dat after each chunk of 1024 text colors
-//! - Atomic u64 aggregation across threads within each chunk
 //!
-//! Outputs:
-//!   output/apca_60.bin   - u32[16777216] LE, count per text hex at |Lc| >= 60
-//!   output/apca_75.bin   - u32[16777216] LE, count per text hex at |Lc| >= 75
-//!   output/apca_90.bin   - u32[16777216] LE, count per text hex at |Lc| >= 90
-//!   output/wcag_3_0.bin  - u32[16777216] LE, count per text hex at ratio >= 3.0
-//!   output/wcag_4_5.bin  - u32[16777216] LE, count per text hex at ratio >= 4.5
-//!   output/wcag_7_0.bin  - u32[16777216] LE, count per text hex at ratio >= 7.0
-//!   output/apca_60_histogram.csv  - histogram (1000 bins) of count distribution
-//!   output/apca_75_histogram.csv  - "
-//!   output/apca_90_histogram.csv  - "
-//!   output/wcag_3_0_histogram.csv - "
-//!   output/wcag_4_5_histogram.csv - "
-//!   output/wcag_7_0_histogram.csv - "
-//!   output/metadata.json - summary stats
-//!   output/progress.dat  - resume checkpoint (deleted on completion)
+//! Usage:
+//!   census                          # normal: index by text color → output/
+//!   census --swap                   # swap: index by bg color → output_bg/
+//!   census --output-dir my_output   # custom output directory
+//!
+//! Outputs (9 .bin files, 9 histogram CSVs, metadata):
+//!   {apca_60,apca_75,apca_90}.bin         - APCA |Lc| >= threshold
+//!   {wcag_3_0,wcag_4_5,wcag_7_0}.bin      - WCAG ratio >= threshold
+//!   {both_apca60_wcag3,both_apca75_wcag45,both_apca90_wcag7}.bin
+//!                                          - cross-threshold (pass BOTH)
+//!   *_histogram.csv                        - 1000-bin histogram per file
+//!   metadata.json                          - summary stats + config
 
 use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
@@ -35,6 +32,7 @@ use std::time::Instant;
 
 const N: usize = 16_777_216; // 256^3
 const CHUNK: usize = 1024; // text colors per checkpoint
+const NUM_COUNTERS: usize = 9;
 
 // ---- sRGB linearization LUT ----
 
@@ -58,7 +56,7 @@ fn luminance(hex: u32, lut: &[f64; 256]) -> f64 {
     0.2126 * lut[r] + 0.7152 * lut[g] + 0.0722 * lut[b]
 }
 
-// ---- APCA (inlined for speed, matches lib.rs exactly) ----
+// ---- APCA constants (matches lib.rs exactly) ----
 
 const BLK_THRS: f64 = 0.022;
 const BLK_CLMP: f64 = 1.414;
@@ -82,17 +80,31 @@ fn fclamp(y: f64) -> f64 {
     }
 }
 
-/// WCAG 2.1 ratio from raw luminances (same as lib.rs contrast_wcag21)
+/// WCAG 2.1 ratio from raw luminances
 #[inline(always)]
 fn wcag_ratio(y1: f64, y2: f64) -> f64 {
     let (hi, lo) = if y1 >= y2 { (y1, y2) } else { (y2, y1) };
     (hi + 0.05) / (lo + 0.05)
 }
 
-// ---- Optimized inner loop: precomputed fclamp values ----
-// By precomputing fclamp for all 16M colors, we avoid calling fclamp
-// inside the hot 281T iteration loop. The APCA powf calls on the
-// fclamp'd values are the real bottleneck.
+// ---- Packed per-color data for cache-friendly inner loop ----
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ColorData {
+    raw_lum: f64,  // relative luminance (for WCAG)
+    fc_lum: f64,   // fclamp'd luminance (for APCA delta check)
+    pow_a: f64,    // inner-variable power for BOW path
+    pow_b: f64,    // inner-variable power for WOB path
+}
+
+// ---- Threshold names ----
+
+const NAMES: [&str; NUM_COUNTERS] = [
+    "apca_60", "apca_75", "apca_90",
+    "wcag_3_0", "wcag_4_5", "wcag_7_0",
+    "both_apca60_wcag3", "both_apca75_wcag45", "both_apca90_wcag7",
+];
 
 // ---- Progress / I/O ----
 
@@ -127,74 +139,112 @@ fn save_bin_u32(path: &Path, data: &[u32]) {
     fs::write(path, bytes).unwrap();
 }
 
-// ---- Threshold definitions ----
+// ---- CLI ----
 
-struct Threshold {
-    name: &'static str,
-    is_apca: bool,
-    value: f64,
+struct Config {
+    swap: bool,
+    output_dir: PathBuf,
 }
 
-const THRESHOLDS: [Threshold; 6] = [
-    Threshold { name: "apca_60",  is_apca: true,  value: 60.0 },
-    Threshold { name: "apca_75",  is_apca: true,  value: 75.0 },
-    Threshold { name: "apca_90",  is_apca: true,  value: 90.0 },
-    Threshold { name: "wcag_3_0", is_apca: false, value: 3.0 },
-    Threshold { name: "wcag_4_5", is_apca: false, value: 4.5 },
-    Threshold { name: "wcag_7_0", is_apca: false, value: 7.0 },
-];
+fn parse_args() -> Config {
+    let args: Vec<String> = std::env::args().collect();
+    let swap = args.iter().any(|a| a == "--swap");
+    let output_dir = args
+        .iter()
+        .position(|a| a == "--output-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if swap {
+                PathBuf::from("output_bg")
+            } else {
+                PathBuf::from("output")
+            }
+        });
+    Config { swap, output_dir }
+}
 
 // ---- Main ----
 
 fn main() {
-    let out = PathBuf::from("output");
-    fs::create_dir_all(&out).unwrap();
+    let cfg = parse_args();
+    let out = &cfg.output_dir;
+    fs::create_dir_all(out).unwrap();
+
+    let mode_label = if cfg.swap {
+        "SWAP (indexing by BACKGROUND color)"
+    } else {
+        "NORMAL (indexing by TEXT color)"
+    };
+    println!("Mode: {}", mode_label);
+    println!("Output: {}/", out.display());
 
     let start = Instant::now();
 
-    // 1. Build sRGB lookup table (256 entries, replaces per-channel powf(2.4))
+    // 1. Build sRGB lookup table
     println!("Building sRGB lookup table...");
     let lut = build_srgb_lut();
 
-    // 2. Precompute raw luminance for all 16M colors
+    // 2. Precompute all luminances
     println!("Computing luminances for all {} colors...", N);
     let raw_lum: Vec<f64> = (0..N as u32)
         .into_par_iter()
         .map(|h| luminance(h, &lut))
         .collect();
-
-    // 3. Precompute fclamp'd luminance for APCA (avoids fclamp in inner loop)
     let fc_lum: Vec<f64> = raw_lum.par_iter().map(|&y| fclamp(y)).collect();
 
-    // 4. Precompute APCA power arrays — eliminates all powf from the inner loop.
-    //    Background needs ^NORM_BG (0.56) for BOW and ^REV_BG (0.65) for WOB.
-    //    Text needs ^NORM_TXT (0.57) for BOW and ^REV_TXT (0.62) for WOB.
-    //    Text powers are only used once per outer iteration, but precomputing
-    //    them too keeps the hot loop completely powf-free.
-    println!("Precomputing APCA power tables (4 × 16M)...");
-    let pow_norm_bg: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(NORM_BG)).collect();
-    let pow_rev_bg: Vec<f64>  = fc_lum.par_iter().map(|&y| y.powf(REV_BG)).collect();
-    let pow_norm_txt: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(NORM_TXT)).collect();
-    let pow_rev_txt: Vec<f64>  = fc_lum.par_iter().map(|&y| y.powf(REV_TXT)).collect();
+    // 3. Build packed ColorData with mode-dependent exponents.
+    //    In normal mode (outer=txt, inner=bg):
+    //      inner needs bg exponents: ^0.56 (BOW), ^0.65 (WOB)
+    //    In swap mode (outer=bg, inner=txt):
+    //      inner needs txt exponents: ^0.57 (BOW), ^0.62 (WOB)
+    let (inner_exp_a, inner_exp_b) = if cfg.swap {
+        (NORM_TXT, REV_TXT) // 0.57, 0.62
+    } else {
+        (NORM_BG, REV_BG) // 0.56, 0.65
+    };
 
     println!(
-        "Precomputation done in {:.2}s  (lum range: {:.8}..{:.8})",
+        "Building packed color data (inner exponents: {:.2}, {:.2})...",
+        inner_exp_a, inner_exp_b,
+    );
+    let colors: Vec<ColorData> = (0..N)
+        .into_par_iter()
+        .map(|i| ColorData {
+            raw_lum: raw_lum[i],
+            fc_lum: fc_lum[i],
+            pow_a: fc_lum[i].powf(inner_exp_a),
+            pow_b: fc_lum[i].powf(inner_exp_b),
+        })
+        .collect();
+
+    // Outer-variable power arrays (opposite exponents from inner).
+    let (outer_exp_a, outer_exp_b) = if cfg.swap {
+        (NORM_BG, REV_BG) // 0.56, 0.65
+    } else {
+        (NORM_TXT, REV_TXT) // 0.57, 0.62
+    };
+    let outer_pow_a: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(outer_exp_a)).collect();
+    let outer_pow_b: Vec<f64> = fc_lum.par_iter().map(|&y| y.powf(outer_exp_b)).collect();
+
+    println!(
+        "Precomputation done in {:.2}s  ({} bytes/color, {:.0}MB packed array)",
         start.elapsed().as_secs_f64(),
-        raw_lum.iter().cloned().fold(f64::INFINITY, f64::min),
-        raw_lum.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        std::mem::size_of::<ColorData>(),
+        (N * std::mem::size_of::<ColorData>()) as f64 / 1_048_576.0,
     );
 
     // 4. Load progress
     let progress_path = out.join("progress.dat");
     let start_chunk = load_progress(&progress_path);
-    let total_chunks = (N + CHUNK - 1) / CHUNK; // 16384
+    let total_chunks = (N + CHUNK - 1) / CHUNK;
 
-    // 5. Load or initialize count arrays (one per threshold)
-    let mut counts: Vec<Vec<u32>> = THRESHOLDS
+    // 5. Load or initialize count arrays
+    let mut counts: Vec<Vec<u32>> = NAMES
         .iter()
-        .map(|th| {
+        .map(|name| {
             if start_chunk > 0 {
-                let path = out.join(format!("{}.bin", th.name));
+                let path = out.join(format!("{}.bin", name));
                 if let Some(data) = load_bin_u32(&path) {
                     return data;
                 }
@@ -205,40 +255,38 @@ fn main() {
 
     if start_chunk > 0 {
         println!(
-            "Resuming from chunk {} / {} ({} text colors already done)",
-            start_chunk,
-            total_chunks,
-            start_chunk * CHUNK,
+            "Resuming from chunk {} / {} ({} colors already done)",
+            start_chunk, total_chunks, start_chunk * CHUNK,
         );
     }
 
     let colors_remaining = N - (start_chunk * CHUNK).min(N);
     println!(
-        "Brute-forcing {} text colors × {} backgrounds × 6 thresholds",
+        "Brute-forcing {} outer colors × {} inner colors × 6 thresholds + 3 cross",
         colors_remaining, N,
     );
-    println!(
-        "Total contrast evaluations remaining: {}",
-        colors_remaining as u128 * N as u128 * 6,
-    );
 
-    // 6. Brute-force: for each text color, iterate ALL backgrounds
+    // In swap mode the subtraction order in the APCA formula reverses.
+    // Normal: inner=bg, outer=txt → BOW when inner.fc > outer.fc
+    //   c = (inner.pow_a - outer_pow_a) * SCALE
+    // Swap: inner=txt, outer=bg → BOW when outer.fc > inner.fc
+    //   c = (outer_pow_a - inner.pow_a) * SCALE
+    let swap = cfg.swap;
+
+    // 6. Brute-force
     for ci in start_chunk..total_chunks {
         let chunk_start = ci * CHUNK;
         let chunk_end = (chunk_start + CHUNK).min(N);
         let chunk_time = Instant::now();
 
-        // Each text color in this chunk processed in parallel via rayon.
-        // For each text color, we iterate all 16M backgrounds sequentially
-        // (the parallelism is across text colors in the chunk).
-        let chunk_results: Vec<[u32; 6]> = (chunk_start..chunk_end)
+        let chunk_results: Vec<[u32; NUM_COUNTERS]> = (chunk_start..chunk_end)
             .into_par_iter()
-            .map(|txt_hex| {
-                let y_txt = raw_lum[txt_hex];
-                let y_txt_fc = fc_lum[txt_hex];
-                // Text-side powers (looked up from precomputed arrays)
-                let txt_pnorm = pow_norm_txt[txt_hex]; // y_txt^0.57
-                let txt_prev  = pow_rev_txt[txt_hex];  // y_txt^0.62
+            .map(|outer_hex| {
+                let outer = &colors[outer_hex];
+                let o_fc = outer.fc_lum;
+                let o_raw = outer.raw_lum;
+                let o_pa = outer_pow_a[outer_hex];
+                let o_pb = outer_pow_b[outer_hex];
 
                 let mut apca_60: u32 = 0;
                 let mut apca_75: u32 = 0;
@@ -246,19 +294,36 @@ fn main() {
                 let mut wcag_3: u32 = 0;
                 let mut wcag_45: u32 = 0;
                 let mut wcag_7: u32 = 0;
+                let mut both_60_3: u32 = 0;
+                let mut both_75_45: u32 = 0;
+                let mut both_90_7: u32 = 0;
 
-                for bg_hex in 0..N {
-                    // APCA: all lookups, no powf
-                    let y_bg_fc = fc_lum[bg_hex];
-                    let c = if (y_bg_fc - y_txt_fc).abs() < DELTA_Y_MIN {
-                        0.0
-                    } else if y_bg_fc > y_txt_fc {
-                        // BOW: bg^0.56 - txt^0.57
-                        (pow_norm_bg[bg_hex] - txt_pnorm) * SCALE_BOW
+                for inner_hex in 0..N {
+                    let inner = &colors[inner_hex];
+
+                    // APCA contrast.
+                    // Determine bg_fc/txt_fc and the correct power subtraction
+                    // based on mode. The branch on `swap` is 100% predicted.
+                    let (bg_fc, txt_fc, bow_diff, wob_diff) = if swap {
+                        // outer=bg, inner=txt
+                        (o_fc, inner.fc_lum,
+                         o_pa - inner.pow_a,  // bg^0.56 - txt^0.57
+                         o_pb - inner.pow_b)  // bg^0.65 - txt^0.62
                     } else {
-                        // WOB: bg^0.65 - txt^0.62
-                        (pow_rev_bg[bg_hex] - txt_prev) * SCALE_WOB
+                        // outer=txt, inner=bg
+                        (inner.fc_lum, o_fc,
+                         inner.pow_a - o_pa,  // bg^0.56 - txt^0.57
+                         inner.pow_b - o_pb)  // bg^0.65 - txt^0.62
                     };
+
+                    let c = if (bg_fc - txt_fc).abs() < DELTA_Y_MIN {
+                        0.0
+                    } else if bg_fc > txt_fc {
+                        bow_diff * SCALE_BOW
+                    } else {
+                        wob_diff * SCALE_WOB
+                    };
+
                     let sapc = if c.abs() < LO_CLIP {
                         0.0
                     } else if c > 0.0 {
@@ -267,51 +332,60 @@ fn main() {
                         c + LO_WOB_OFFSET
                     };
                     let lc = (sapc * 100.0).abs();
-                    if lc >= 60.0 {
+
+                    // WCAG (symmetric, no swap needed)
+                    let ratio = wcag_ratio(o_raw, inner.raw_lum);
+
+                    // Threshold checks
+                    let a60 = lc >= 60.0;
+                    let a75 = lc >= 75.0;
+                    let a90 = lc >= 90.0;
+                    let w3 = ratio >= 3.0;
+                    let w45 = ratio >= 4.5;
+                    let w7 = ratio >= 7.0;
+
+                    // Individual counters (nested for branch-prediction friendliness)
+                    if a60 {
                         apca_60 += 1;
-                        if lc >= 75.0 {
+                        if a75 {
                             apca_75 += 1;
-                            if lc >= 90.0 {
-                                apca_90 += 1;
-                            }
+                            if a90 { apca_90 += 1; }
+                        }
+                    }
+                    if w3 {
+                        wcag_3 += 1;
+                        if w45 {
+                            wcag_45 += 1;
+                            if w7 { wcag_7 += 1; }
                         }
                     }
 
-                    // WCAG: use raw luminances
-                    let ratio = wcag_ratio(y_txt, raw_lum[bg_hex]);
-                    if ratio >= 3.0 {
-                        wcag_3 += 1;
-                        if ratio >= 4.5 {
-                            wcag_45 += 1;
-                            if ratio >= 7.0 {
-                                wcag_7 += 1;
-                            }
-                        }
-                    }
+                    // Cross-threshold counters
+                    if a60 && w3 { both_60_3 += 1; }
+                    if a75 && w45 { both_75_45 += 1; }
+                    if a90 && w7 { both_90_7 += 1; }
                 }
 
-                [apca_60, apca_75, apca_90, wcag_3, wcag_45, wcag_7]
+                [apca_60, apca_75, apca_90, wcag_3, wcag_45, wcag_7,
+                 both_60_3, both_75_45, both_90_7]
             })
             .collect();
 
-        // Write results into count arrays
+        // Write results
         for (i, r) in chunk_results.into_iter().enumerate() {
             let hex = chunk_start + i;
-            counts[0][hex] = r[0];
-            counts[1][hex] = r[1];
-            counts[2][hex] = r[2];
-            counts[3][hex] = r[3];
-            counts[4][hex] = r[4];
-            counts[5][hex] = r[5];
+            for t in 0..NUM_COUNTERS {
+                counts[t][hex] = r[t];
+            }
         }
 
-        // Save checkpoint after every chunk
-        for (t, th) in THRESHOLDS.iter().enumerate() {
-            save_bin_u32(&out.join(format!("{}.bin", th.name)), &counts[t]);
+        // Checkpoint
+        for (t, name) in NAMES.iter().enumerate() {
+            save_bin_u32(&out.join(format!("{}.bin", name)), &counts[t]);
         }
         save_progress(&progress_path, ci + 1);
 
-        // Progress reporting
+        // Progress
         let elapsed_total = start.elapsed().as_secs_f64();
         let chunks_done = (ci + 1 - start_chunk) as f64;
         let chunks_left = (total_chunks - ci - 1) as f64;
@@ -334,9 +408,9 @@ fn main() {
     }
 
     // 7. Summary
-    println!("\n=== RESULTS ===");
+    println!("\n=== RESULTS ({}) ===", mode_label);
     let mut stats_json = Vec::new();
-    for (t, th) in THRESHOLDS.iter().enumerate() {
+    for (t, name) in NAMES.iter().enumerate() {
         let total: u64 = counts[t].iter().map(|&c| c as u64).sum();
         let max = *counts[t].iter().max().unwrap();
         let min = *counts[t].iter().min().unwrap();
@@ -345,15 +419,13 @@ fn main() {
         let pct = total as f64 / total_possible as f64 * 100.0;
 
         println!(
-            "{:>8}: {:>15} passing pairs ({:>5.2}%)  min={:<8} max={:<8} mean={:.1}",
-            th.name, total, pct, min, max, mean,
+            "{:>24}: {:>15} pairs ({:>5.2}%)  min={:<8} max={:<8} mean={:.1}",
+            name, total, pct, min, max, mean,
         );
 
         stats_json.push(serde_json::json!({
-            "name": th.name,
-            "algorithm": if th.is_apca { "APCA" } else { "WCAG 2.1" },
-            "threshold": th.value,
-            "file": format!("{}.bin", th.name),
+            "name": name,
+            "file": format!("{}.bin", name),
             "format": "little-endian u32[16777216], indexed by hex 0x000000..0xFFFFFF",
             "total_passing_pairs": total,
             "total_possible_pairs": total_possible,
@@ -364,14 +436,15 @@ fn main() {
         }));
     }
 
-    // 8. Save metadata
+    // 8. Metadata
     let meta = serde_json::json!({
-        "description": "Brute-force color contrast census: for each 24-bit sRGB hex (as text), count of ALL 16,777,216 background colors meeting the contrast threshold. Every single combination tested.",
+        "description": "Brute-force color contrast census. Every single combination tested.",
+        "mode": if cfg.swap { "swap (indexed by background)" } else { "normal (indexed by text)" },
         "num_colors": N,
         "num_possible_pairs": N as u64 * N as u64,
         "chunk_size": CHUNK,
         "elapsed_seconds": start.elapsed().as_secs_f64(),
-        "thresholds": stats_json,
+        "counters": stats_json,
     });
     fs::write(
         out.join("metadata.json"),
@@ -379,13 +452,17 @@ fn main() {
     )
     .unwrap();
 
-    // 9. Generate histogram CSVs
+    // 9. Histogram CSVs
     println!("\nGenerating histograms...");
-    for (t, th) in THRESHOLDS.iter().enumerate() {
-        write_histogram_csv(&out.join(format!("{}_histogram.csv", th.name)), &counts[t], th.name);
+    for (t, name) in NAMES.iter().enumerate() {
+        write_histogram_csv(
+            &out.join(format!("{}_histogram.csv", name)),
+            &counts[t],
+            name,
+        );
     }
 
-    // Clean up progress on completion
+    // Clean up progress
     let _ = fs::remove_file(&progress_path);
 
     println!(
@@ -396,13 +473,11 @@ fn main() {
     );
 }
 
-// ---- Histogram CSV generation ----
+// ---- Histogram CSV ----
 
 fn write_histogram_csv(path: &Path, counts: &[u32], name: &str) {
-    // Collect frequency: how many hex colors have exactly `count` accessible pairs
     let max_count = *counts.iter().max().unwrap_or(&0) as usize;
 
-    // Use 1000 bins spanning 0..=max_count for a manageable CSV
     let num_bins: usize = 1000;
     let bin_width = if max_count == 0 {
         1.0
@@ -426,5 +501,11 @@ fn write_histogram_csv(path: &Path, counts: &[u32], name: &str) {
     }
 
     fs::write(path, csv).unwrap();
-    println!("  {} -> {} ({} bins, bin_width={:.1})", name, path.display(), num_bins, bin_width);
+    println!(
+        "  {} -> {} ({} bins, width={:.1})",
+        name,
+        path.display(),
+        num_bins,
+        bin_width,
+    );
 }
